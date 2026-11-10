@@ -1,0 +1,586 @@
+--// ========== WindUI ==========
+local WindUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Footagesus/WindUI/main/dist/main.lua"))()
+
+--// ========== Services ==========
+local Players           = game:GetService("Players")
+local TweenService      = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+
+--// ========== Config ==========
+local POS_ACCEPT = Vector3.new(-238.11, 256.15, 340.17)
+local POS_FRIDGE = Vector3.new(-277.66, 256.15, 337.00)
+local POS_GRILL  = Vector3.new(-266.41, 256.15, 337.14)
+
+local SPEED_BEFORE = 50
+local SPEED_AFTER  = 150
+
+local WAIT_BEFORE_REMOTE = 8      -- รอกี่วิ ก่อนยิงรีโมท Finish
+local ACCEPT_TIMEOUT     = 4      -- รอ Feedback จาก server สูงสุดกี่วิ
+local AFTER_FINISH_WAIT  = 3      -- รอหลังยิง Finish ให้ server ประมวลผลก่อนหยิบเนื้อรอบใหม่
+
+local FEEDBACK_ACCEPT = "Shift started. Get steak from the fridge."
+
+local CookRemote = ReplicatedStorage:WaitForChild("MD_CookRemote", 10)
+local CashFX     = ReplicatedStorage:WaitForChild("MD_CashPickupFX", 10)
+
+--// ========== State ==========
+local Window                       -- ประกาศไว้ก่อน ให้ฟังก์ชันด้านล่างเรียกใช้ได้
+local onAccepted
+local running      = false
+local loopActive   = false
+local activeTween  = nil
+local activeBeam   = nil
+local statusSetter = nil
+local shiftStarted = false
+local lastFeedback = ""
+local hasTouchInterest = (type(firetouchinterest) == "function")
+
+--// ========== ฟัง Feedback จริงจาก server ==========
+if CookRemote then
+    CookRemote.OnClientEvent:Connect(function(action, ...)
+        local msg = tostring(({...})[1] or "")
+        if action == "Feedback" then
+            lastFeedback = msg
+            print("[AutoCook] 📢 Feedback:", msg)
+            local lower = msg:lower()
+            if (lower:find("shift started") or lower:find("get steak")) and not shiftStarted then
+                shiftStarted = true
+                print("[AutoCook] ✅ shiftStarted = true (จาก server)")
+                if onAccepted then onAccepted() end
+            end
+        else
+            print("[AutoCook] 📡 OnClientEvent:", action, msg)
+        end
+    end)
+end
+
+--// ========== Object resolvers ==========
+local function resolve(...)
+    local obj = workspace
+    for _, n in ipairs({...}) do
+        if type(n) == "number" then
+            obj = obj:GetChildren()[n]
+        else
+            obj = obj:FindFirstChild(n)
+        end
+        if not obj then return nil end
+    end
+    return obj
+end
+
+local function getShiftObj()
+    return resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior","SteakHouseBeacon","TouchPart","MD_CookShift")
+end
+
+local function getFridgeObj()
+    local interior = resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior")
+    if not interior then return nil end
+    local fridge = interior:FindFirstChild("Fridge")
+    if not fridge then return nil end
+
+    -- พาธหลัก: Interior.Fridge.Base
+    local base = fridge:FindFirstChild("Base")
+    if base then
+        return base:FindFirstChild("MD_CookFridge") or base
+    end
+
+    -- fallback: หาตามชื่อ
+    for _, d in pairs(fridge:GetDescendants()) do
+        if d.Name == "MD_CookFridge" then return d end
+    end
+    return nil
+end
+
+-- ตำแหน่งของ object ไม่ว่าจะเป็น Part / Model / Prompt
+local function objPos(obj)
+    if not obj then return nil end
+    if obj:IsA("BasePart") then return obj.Position end
+    if obj:IsA("Model") then
+        local ok, cf = pcall(function() return obj:GetPivot() end)
+        if ok and cf then return cf.Position end
+    end
+    local par = obj.Parent
+    while par and par ~= workspace do
+        if par:IsA("BasePart") then return par.Position end
+        if par:IsA("Model") then
+            local ok, cf = pcall(function() return par:GetPivot() end)
+            if ok and cf then return cf.Position end
+        end
+        par = par.Parent
+    end
+    return nil
+end
+
+local function getGrillObj()
+    local interior = resolve("Map","Tiles","ShoppingTile","SteakHouse","Interior")
+    if not interior then return nil end
+
+    -- รวมผู้สมัครทุกเตาใน Interior (MD_CookGrill หรือ GrillArea ที่ไม่มี MD_CookGrill ข้างใน)
+    local candidates = {}
+    for _, d in ipairs(interior:GetDescendants()) do
+        if d.Name == "MD_CookGrill" then
+            table.insert(candidates, d)
+        elseif d.Name == "GrillArea" and not d:FindFirstChild("MD_CookGrill", true) then
+            table.insert(candidates, d)
+        end
+    end
+
+    -- เลือกอันที่ใกล้จุดยืนเตา (POS_GRILL) ที่สุด
+    local best, bestDist
+    for _, c in ipairs(candidates) do
+        local pos = objPos(c)
+        if pos then
+            local dist = (pos - POS_GRILL).Magnitude
+            if not bestDist or dist < bestDist then
+                best, bestDist = c, dist
+            end
+        end
+    end
+    if best then return best, bestDist end
+
+    -- fallback: พาธที่เคยให้มา
+    local c65 = interior:GetChildren()[65]
+    local ga = c65 and c65:FindFirstChild("GrillArea")
+    if ga then return ga:FindFirstChild("MD_CookGrill") or ga end
+    return nil
+end
+
+--// ========== Helpers ==========
+local function setStatus(text, color)
+    if statusSetter then pcall(statusSetter, text, color or Color3.fromRGB(200,200,200)) end
+    print("[AutoCook]", text)
+end
+
+local function getChar() return player.Character or player.CharacterAdded:Wait() end
+local function getHRP()
+    local c = player.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+--// ========== Universal interact (ใช้กับตู้เย็น/เตา) ==========
+local function prepPrompt(p)
+    pcall(function()
+        p.Enabled = true
+        p.RequiresLineOfSight = false
+        p.HoldDuration = 0
+        if p.MaxActivationDistance < 30 then p.MaxActivationDistance = 30 end
+    end)
+end
+
+local function findTouchPart(obj)
+    if obj:IsA("BasePart") then return obj end
+    if obj:IsA("Model") then
+        return obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+    end
+    local inner = obj:FindFirstChildWhichIsA("BasePart", true)
+    if inner then return inner end
+    local par = obj.Parent
+    if par and par:IsA("BasePart") then return par end
+    if par and par:IsA("Model") then
+        return par.PrimaryPart or par:FindFirstChildWhichIsA("BasePart", true)
+    end
+    return nil
+end
+
+local function interact(obj, label)
+    if not obj then print("[Interact]", label or "?", "= nil"); return false end
+    print(("[Interact] %s → %s [%s]"):format(label or "?", obj:GetFullName(), obj.ClassName))
+    local handled = false
+
+    if obj:IsA("ProximityPrompt") then
+        prepPrompt(obj)
+        pcall(fireproximityprompt, obj)
+        handled = true
+    elseif obj:IsA("ClickDetector") then
+        pcall(fireclickdetector, obj)
+        handled = true
+    elseif obj:IsA("RemoteEvent") then
+        for _, a in ipairs({"Start","Accept","Begin","Open","Trigger"}) do
+            pcall(function() obj:FireServer(a) end)
+        end
+        pcall(function() obj:FireServer() end)
+        handled = true
+    end
+
+    for _, d in pairs(obj:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then
+            prepPrompt(d)
+            pcall(fireproximityprompt, d); handled = true
+        elseif d:IsA("ClickDetector") then
+            pcall(fireclickdetector, d); handled = true
+        end
+    end
+
+    if hasTouchInterest then
+        local tp = findTouchPart(obj)
+        if tp then
+            local hrp = getHRP()
+            if hrp then
+                pcall(function() firetouchinterest(hrp, tp, 0) end)
+                task.wait(0.05)
+                pcall(function() firetouchinterest(hrp, tp, 1) end)
+                handled = true
+            end
+        end
+    end
+    return handled
+end
+
+--// ========== กดรับงาน "ครั้งเดียว" ==========
+local function pressShiftOnce()
+    local obj = getShiftObj()
+    if not obj then
+        print("[AutoCook] ❌ ไม่เจอ MD_CookShift")
+        return false
+    end
+    print(("[AutoCook] กดรับงาน → %s [%s]"):format(obj:GetFullName(), obj.ClassName))
+
+    -- 1) ProximityPrompt
+    local prompt = obj:IsA("ProximityPrompt") and obj or obj:FindFirstChildWhichIsA("ProximityPrompt", true)
+    if prompt then
+        pcall(function() prompt.Enabled = true end)
+        pcall(fireproximityprompt, prompt)
+        return true
+    end
+
+    -- 2) ClickDetector
+    local cd = obj:IsA("ClickDetector") and obj or obj:FindFirstChildWhichIsA("ClickDetector", true)
+    if cd then
+        pcall(fireclickdetector, cd)
+        return true
+    end
+
+    -- 3) Touch
+    local part = obj:IsA("BasePart") and obj or obj.Parent
+    local hrp = getHRP()
+    if hasTouchInterest and part and part:IsA("BasePart") and hrp then
+        pcall(function() firetouchinterest(hrp, part, 0) end)
+        task.wait(0.05)
+        pcall(function() firetouchinterest(hrp, part, 1) end)
+        return true
+    end
+
+    return false
+end
+
+--// ========== แจ้งเตือนเมื่อ server ตอบว่ารับงานแล้ว ==========
+onAccepted = function()
+    if Window then
+        pcall(function()
+            Window:Notify({
+                Title    = "✅ รับงานสำเร็จ",
+                Content  = FEEDBACK_ACCEPT,
+                Duration = 3,
+            })
+        end)
+    end
+    setStatus("✅ " .. FEEDBACK_ACCEPT, Color3.fromRGB(0,255,120))
+end
+
+--// ========== Beam / Tween ==========
+local function showBeam(fromPos, toPos, duration)
+    if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+    local dist = (toPos - fromPos).Magnitude
+    if dist < 2 then return end
+    local part = Instance.new("Part")
+    part.Name = "AutoCookGuide"
+    part.Anchored = true; part.CanCollide = false
+    part.CanQuery = false; part.CanTouch = false
+    part.Material = Enum.Material.Neon
+    part.Color = Color3.fromRGB(0, 255, 170)
+    part.Transparency = 0.35
+    part.Size = Vector3.new(0.4, 0.4, dist)
+    part.CFrame = CFrame.lookAt((fromPos + toPos)/2, toPos)
+    part.Parent = workspace
+    activeBeam = part
+    task.delay(duration + 0.5, function()
+        if not part.Parent then return end
+        for i = 1, 10 do
+            if not part.Parent then break end
+            part.Transparency = 0.35 + i * 0.065
+            task.wait(0.05)
+        end
+        if part.Parent then part:Destroy() end
+    end)
+end
+
+local function tweenWalk(targetPos, speed)
+    local char = getChar()
+    local hrp = char:WaitForChild("HumanoidRootPart", 5)
+    if not hrp then return false end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then hum.WalkSpeed = speed end
+
+    local startPos = hrp.Position
+    local flatDist = (Vector3.new(startPos.X,0,startPos.Z) - Vector3.new(targetPos.X,0,targetPos.Z)).Magnitude
+    if flatDist < 2 then
+        pcall(function() hrp.CFrame = CFrame.new(targetPos) end)
+        return true
+    end
+
+    local duration = math.max(flatDist / speed, 0.2)
+    showBeam(startPos, targetPos, duration)
+
+    if activeTween then pcall(function() activeTween:Cancel() end) end
+    activeTween = TweenService:Create(hrp, TweenInfo.new(duration, Enum.EasingStyle.Linear), { CFrame = CFrame.new(targetPos) })
+    local done = false
+    local conn = activeTween.Completed:Connect(function() done = true end)
+    activeTween:Play()
+
+    local t = 0
+    while not done and t < duration + 5 do
+        task.wait(0.05); t = t + 0.05
+        if not hrp or not hrp.Parent then break end
+    end
+    conn:Disconnect(); activeTween = nil
+    if hrp and hrp.Parent then pcall(function() hrp.CFrame = CFrame.new(targetPos) end) end
+    return true
+end
+
+--// ========== Steps ==========
+local function stepAccept()
+    if shiftStarted then return true end
+
+    setStatus("🚶 ไปจุดรับงาน (speed " .. SPEED_BEFORE .. ")")
+    tweenWalk(POS_ACCEPT, SPEED_BEFORE)
+    task.wait(0.3)
+
+    setStatus("🔵 กดรับงาน (ครั้งเดียว)...")
+    pressShiftOnce()
+
+    -- รอ Feedback จริงจาก server
+    local t = 0
+    while running and not shiftStarted and t < ACCEPT_TIMEOUT do
+        task.wait(0.1)
+        t = t + 0.1
+    end
+
+    if not shiftStarted then
+        setStatus("⚠️ server ยังไม่ตอบ จะลองใหม่", Color3.fromRGB(255,200,80))
+    end
+    return shiftStarted
+end
+
+local function stepFridge()
+    -- เดิน/วาร์ปเข้าจุดตู้เย็นเสมอ (ถ้ายืนอยู่แล้วฟังก์ชันจะแค่ snap ตำแหน่ง ไม่เสียเวลา)
+    setStatus("🚶 ไปตู้เย็น (speed " .. SPEED_AFTER .. ")")
+    tweenWalk(POS_FRIDGE, SPEED_AFTER)
+    task.wait(0.3)
+
+    setStatus("🧊 กด MD_CookFridge")
+    for i = 1, 5 do
+        if not running then return end
+        interact(getFridgeObj(), "MD_CookFridge")
+        task.wait(0.4)
+    end
+    task.wait(0.4)
+end
+
+local function stepGrill()
+    setStatus("🚶 ไปเตาย่าง (speed " .. SPEED_AFTER .. ")")
+    tweenWalk(POS_GRILL, SPEED_AFTER)
+    task.wait(0.3)
+    local hrp = getHRP()
+
+    local grill, gdist = getGrillObj()
+    if grill then
+        print(("[AutoCook] เตาที่เลือก: %s [%s] ห่าง POS_GRILL %.1f studs"):format(grill:GetFullName(), grill.ClassName, gdist or -1))
+        if gdist and gdist > 20 then
+            warn("[AutoCook] ⚠️ เตาที่เจออยู่ไกลจาก POS_GRILL มาก ตรวจพิกัดเตาอีกที")
+        end
+    else
+        warn("[AutoCook] ❌ ไม่เจอเตาเลย")
+    end
+
+    setStatus("🔥 กด MD_CookGrill")
+    if hrp then
+        for i = 1, 4 do
+            if not running then return end
+            pcall(function() hrp.CFrame = CFrame.new(POS_GRILL + Vector3.new(0,0,1.5)) end)
+            task.wait(0.15)
+            pcall(function() hrp.CFrame = CFrame.new(POS_GRILL + Vector3.new(0,0,-1.5)) end)
+            task.wait(0.15)
+            if not grill or not grill.Parent then grill = getGrillObj() end
+            interact(grill, "MD_CookGrill")
+            task.wait(0.2)
+        end
+    end
+    task.wait(0.5)
+end
+
+local function stepCook()
+    -- วางสเต็กเสร็จ → ไปรอหน้าตู้เย็นทันที
+    setStatus("🚶 กลับไปรอหน้าตู้เย็น")
+    tweenWalk(POS_FRIDGE, SPEED_AFTER)
+
+    for i = WAIT_BEFORE_REMOTE, 1, -1 do
+        if not running then return end
+        setStatus(("⏳ รอหน้าตู้เย็น %d วิ ก่อนยิงรีโมท..."):format(i), Color3.fromRGB(255,200,80))
+        task.wait(1)
+    end
+
+    setStatus("🔥 Finish (ยิง MD_CookRemote)")
+    pcall(function() if CookRemote then CookRemote:FireServer("Finish") end end)
+    task.wait(0.2)
+    for _, a in ipairs({"finish_grilling_2","Finish","finish"}) do
+        pcall(function() if CookRemote then CookRemote:FireServer(a) end end)
+    end
+    task.wait(0.3)
+    pcall(function()
+        if firesignal and CookRemote then
+            firesignal(CookRemote.OnClientEvent, "Finished", "Perfect!", 160, 26)
+        end
+        if firesignal and CashFX then
+            firesignal(CashFX.OnClientEvent, "Pickup", 160)
+        end
+    end)
+    task.wait(AFTER_FINISH_WAIT)
+end
+
+local function mainLoop()
+    while running do
+        local ok, err = pcall(function()
+            if not shiftStarted then
+                if not stepAccept() then
+                    task.wait(1); return
+                end
+            end
+            if not running then return end
+            stepFridge()
+            if not running then return end
+            stepGrill()
+            if not running then return end
+            stepCook()
+            task.wait(0.1)
+        end)
+        if not ok then warn("[AutoCook] Error:", err); task.wait(1) end
+    end
+end
+
+--// ========== Respawn ==========
+player.CharacterAdded:Connect(function()
+    if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+    if activeTween then pcall(function() activeTween:Cancel() end) end
+    shiftStarted = false
+end)
+
+--// ========== Status Bar ==========
+local statusGui = Instance.new("ScreenGui")
+statusGui.Name = "AutoCookStatus"
+statusGui.ResetOnSpawn = false
+statusGui.IgnoreGuiInset = true
+statusGui.Parent = player:WaitForChild("PlayerGui")
+
+local statusFrame = Instance.new("Frame")
+statusFrame.Size = UDim2.new(0, 500, 0, 34)
+statusFrame.Position = UDim2.new(0.5, -250, 0, 12)
+statusFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+statusFrame.BackgroundTransparency = 0.2
+statusFrame.BorderSizePixel = 0
+statusFrame.Visible = false
+statusFrame.Parent = statusGui
+Instance.new("UICorner", statusFrame).CornerRadius = UDim.new(0, 8)
+
+local statusText = Instance.new("TextLabel")
+statusText.Size = UDim2.new(1, -20, 1, 0)
+statusText.Position = UDim2.new(0, 10, 0, 0)
+statusText.BackgroundTransparency = 1
+statusText.TextColor3 = Color3.fromRGB(200, 200, 200)
+statusText.Font = Enum.Font.GothamBold
+statusText.TextSize = 14
+statusText.TextXAlignment = Enum.TextXAlignment.Left
+statusText.Parent = statusFrame
+
+statusSetter = function(text, color)
+    statusFrame.Visible = true
+    statusText.Text = " " .. text
+    statusText.TextColor3 = color
+end
+
+--// ========== Window ==========
+Window = WindUI:CreateWindow({
+    Title = "Steak Cook Auto",
+    Author = "Assistant",
+    Icon = "rbxassetid://11743494330",
+    Folder = "SteakCookAuto",
+    Size = UDim2.fromOffset(540, 520),
+    Theme = "Dark",
+    Transparent = true,
+})
+
+local MainTab  = Window:Tab({ Title = "Main",  Icon = "utensils" })
+local DebugTab = Window:Tab({ Title = "Debug", Icon = "bug" })
+
+MainTab:Section({ Title = "Auto Settings" })
+MainTab:Toggle({
+    Title = "Auto Cook Steak",
+    Description = "รับงาน → ตู้เย็น → เตา → รอหน้าตู้เย็น → Finish",
+    Value = false,
+    Callback = function(state)
+        running = state
+        if state then
+            statusFrame.Visible = true
+            if not loopActive then
+                loopActive = true
+                task.spawn(function() pcall(mainLoop); loopActive = false end)
+            end
+        else
+            statusFrame.Visible = false
+            if activeTween then pcall(function() activeTween:Cancel() end) end
+            if activeBeam and activeBeam.Parent then activeBeam:Destroy() end
+        end
+    end,
+})
+
+MainTab:Section({ Title = "Delay ก่อนยิงรีโมท" })
+MainTab:Slider({
+    Title = "รอกี่วิก่อนยิงรีโมท",
+    Description = "ค่าเริ่มต้น 8 วินาที",
+    Value = { Min = 3, Max = 30, Default = 6},
+    Callback = function(v)
+        WAIT_BEFORE_REMOTE = math.floor(v)
+        print("[AutoCook] WAIT_BEFORE_REMOTE =", WAIT_BEFORE_REMOTE)
+    end,
+})
+
+MainTab:Section({ Title = "Delay หลังยิง Finish" })
+MainTab:Slider({
+    Title = "รอหลัง Finish กี่วิ",
+    Description = "ค่าเริ่มต้น 3 วินาที (หยิบเนื้อไม่ติดให้เพิ่ม / ติดแล้วค่อยลดทีละ 1)",
+    Value = { Min = 0, Max = 8, Default = 0},
+    Callback = function(v)
+        AFTER_FINISH_WAIT = math.floor(v)
+        print("[AutoCook] AFTER_FINISH_WAIT =", AFTER_FINISH_WAIT)
+    end,
+})
+
+MainTab:Section({ Title = "พิกัด (Tween Walk)" })
+MainTab:Paragraph({ Title = "📍 รับงาน",  Desc = "-238.11, 256.15, 340.17 (speed 50)" })
+MainTab:Paragraph({ Title = "🧊 ตู้เย็น", Desc = "-277.66, 256.15, 337.00 (speed 150)" })
+MainTab:Paragraph({ Title = "🔥 เตาย่าง", Desc = "-266.41, 256.15, 337.14 (speed 150)" })
+
+DebugTab:Section({ Title = "Debug" })
+DebugTab:Button({
+    Title = "🔍 Inspect Objects",
+    Callback = function()
+        local s, f, g = getShiftObj(), getFridgeObj(), getGrillObj()
+        print("========== INSPECT ==========")
+        print("MD_CookShift :", s and (s:GetFullName() .. "  [" .. s.ClassName .. "]") or "❌ NOT FOUND")
+        print("MD_CookFridge:", f and (f:GetFullName() .. "  [" .. f.ClassName .. "]") or "❌ NOT FOUND")
+        print("MD_CookGrill :", g and (g:GetFullName() .. "  [" .. g.ClassName .. "]") or "❌ NOT FOUND")
+        print("=============================")
+        Window:Notify({ Title = "Inspect", Content = "ดูใน Console (F9)", Duration = 4 })
+    end,
+})
+DebugTab:Button({ Title = "🔥 Fire Shift (กดครั้งเดียว)",
+    Callback = function() pressShiftOnce() end })
+DebugTab:Button({ Title = "🧊 Fire Fridge (ทดสอบ)",
+    Callback = function() interact(getFridgeObj(), "MD_CookFridge(test)") end })
+DebugTab:Button({ Title = "🔥 Fire Grill (ทดสอบ)",
+    Callback = function() interact(getGrillObj(), "MD_CookGrill(test)") end })
+DebugTab:Button({ Title = "📢 Show Feedback (ทดสอบ)",
+    Callback = function() if onAccepted then onAccepted() end end })
+DebugTab:Button({ Title = "🔄 Reset",
+    Callback = function() shiftStarted = false; lastFeedback = ""; print("[Reset] cleared") end })
